@@ -9,13 +9,18 @@ clap = "4.5.55"
 crossterm = "0.29.0"
 geo = "0.32.0"
 lru = "0.16.3"
-ndarray = "0.17.2"
+ndarray = "0.16"
 parking_lot = "0.12.5"
 ratatui = "0.30.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.18"
-tokio = { version = "1.49.0", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio = { version = "1.49.0", features = [
+  "rt-multi-thread",
+  "sync",
+  "time",
+  "macros",
+] }
 zarrs = "0.22.10"
 zarrs_filesystem = "0.3.9"
 
