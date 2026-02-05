@@ -1,13 +1,13 @@
 /// simplified version
 #[derive(Debug)]
 pub struct Camera {
-    pub center_lat: f64,
-    pub center_lon: f64,
-    pub zoom: f64,
+    pub center_lat: f32,
+    pub center_lon: f32,
+    pub zoom: f32,
 }
 
 impl Camera {
-    pub fn new(center_lat: f64, center_lon: f64, zoom: f64) -> Self {
+    pub fn new(center_lat: f32, center_lon: f32, zoom: f32) -> Self {
         Self {
             center_lat,
             center_lon,
@@ -15,7 +15,7 @@ impl Camera {
         }
     }
 
-    pub fn pan(&mut self, dlat: f64, dlon: f64) {
+    pub fn pan(&mut self, dlat: f32, dlon: f32) {
         self.center_lat += dlat;
         self.center_lon += dlon;
 
@@ -34,6 +34,12 @@ impl Camera {
         self.zoom = self.zoom.min(100.0);
     }
 
+    pub fn set(&mut self, center_lat: f32, center_lon: f32, zoom: f32) {
+        self.center_lat = center_lat;
+        self.center_lon = center_lon;
+        self.zoom = zoom;
+    }
+
     pub fn reset(&mut self) {
         self.center_lat = 0.0;
         self.center_lon = 0.0;
@@ -46,12 +52,12 @@ impl Camera {
         screen_y: u16,
         screen_width: u16,
         screen_height: u16,
-    ) -> (f64, f64) {
-        let center_x = screen_width as f64 / 2.0;
-        let center_y = screen_height as f64 / 2.0;
+    ) -> (f32, f32) {
+        let center_x = screen_width as f32 / 2.0;
+        let center_y = screen_height as f32 / 2.0;
 
-        let dx = screen_x as f64 - center_x;
-        let dy = screen_y as f64 - center_y;
+        let dx = screen_x as f32 - center_x;
+        let dy = screen_y as f32 - center_y;
 
         let lon = self.center_lon + dx * self.zoom;
         // negative because screen Y is inverted
@@ -62,19 +68,53 @@ impl Camera {
 
     pub fn geo_to_indices(
         &self,
-        lat: f64,
-        lon: f64,
+        lat: f32,
+        lon: f32,
         lat_coords: &[f32],
         lon_coords: &[f32],
     ) -> Option<(usize, usize)> {
-        let lat_idx = lat_coords
-            .iter()
-            .position(|&coord_lat| (coord_lat - lat as f32).abs() < 2.0)?;
-
-        let lon_idx = lon_coords
-            .iter()
-            .position(|&coord_lon| (coord_lon - lon as f32).abs() < 2.0)?;
-
+        let lat_idx = binary_search_nearest(lat_coords, lat)?;
+        let lon_idx = binary_search_nearest(lon_coords, lon)?;
         Some((lat_idx, lon_idx))
+    }
+}
+
+/// Binary search to find nearest index in a sorted array (ascending or descending)
+fn binary_search_nearest(coords: &[f32], value: f32) -> Option<usize> {
+    if coords.is_empty() {
+        return None;
+    }
+
+    // check if value is in range
+    let (min, max) = if coords[0] < coords[coords.len() - 1] {
+        (coords[0], coords[coords.len() - 1])
+    } else {
+        (coords[coords.len() - 1], coords[0])
+    };
+
+    if value < min || value > max {
+        return None;
+    }
+
+    // determine if ascending or descending
+    let ascending = coords[0] < coords[coords.len() - 1];
+
+    let idx = if ascending {
+        coords.partition_point(|&x| x < value)
+    } else {
+        coords.partition_point(|&x| x > value)
+    };
+
+    // clamp and find nearest between idx-1 and idx
+    let idx = idx.min(coords.len() - 1);
+    if idx == 0 {
+        return Some(0);
+    }
+
+    let prev = idx - 1;
+    if (coords[prev] - value).abs() < (coords[idx] - value).abs() {
+        Some(prev)
+    } else {
+        Some(idx)
     }
 }

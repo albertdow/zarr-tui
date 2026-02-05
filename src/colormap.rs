@@ -3,7 +3,7 @@ use ratatui::style::Color;
 pub struct ColorMap;
 
 impl ColorMap {
-    pub fn map_value(value: f64, min: f64, max: f64) -> Color {
+    pub fn map_value(value: f32, min: f32, max: f32) -> Color {
         // normalise to 0-1
         let t = if (max - min).abs() < 1e-10 {
             0.5
@@ -12,7 +12,7 @@ impl ColorMap {
         };
 
         // gist_ncar key colours (sampled from matplotlib)
-        const GIST_NCAR: [(f64, u8, u8, u8); 9] = [
+        const GIST_NCAR: [(f32, u8, u8, u8); 9] = [
             (0.000, 0, 0, 128),
             (0.125, 0, 76, 255),
             (0.250, 0, 206, 209),
@@ -32,7 +32,7 @@ impl ColorMap {
         let (t1, r1, g1, b1) = GIST_NCAR[j];
         let f = (t - t0) / (t1 - t0);
 
-        let lerp = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * f) as u8;
+        let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f) as u8;
         Color::Rgb(lerp(r0, r1), lerp(g0, g1), lerp(b0, b1))
     }
 }

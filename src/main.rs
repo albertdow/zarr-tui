@@ -1,12 +1,26 @@
 mod camera;
 mod colormap;
+mod ui;
+mod zarr;
+use ui::{HelpOverlay, StatusBar, StatusBarData};
 
 use ndarray::{ArrayD, IxDyn};
 use std::{io, sync::Arc};
 use zarrs::{array::Array, array_subset::ArraySubset};
 
+use anyhow::Result;
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{Terminal, layout::Rect, prelude::CrosstermBackend};
+
+use camera::Camera;
+use colormap::ColorMap;
+use zarrs_filesystem::FilesystemStore;
+
 struct ArrayMeta {
-    shape: Vec<u64>,
     lon_axis: usize,
     lat_axis: usize,
 }
@@ -15,63 +29,39 @@ impl ArrayMeta {
     fn from_array<TStorage: zarrs::storage::ReadableStorageTraits + ?Sized>(
         array: &Array<TStorage>,
     ) -> Option<Self> {
-        let shape = array.shape().to_vec();
-        let dim_names = array.dimension_names().as_ref()?;
+        // zarr v3: native dimension_names in array metadata
+        let dim_names: Vec<String> = if let Some(names) = array.dimension_names() {
+            names.iter().filter_map(|n| n.clone()).collect()
+        } else {
+            // zarr v2: xarray stores dimension names in _ARRAY_DIMENSIONS attr
+            array
+                .attributes()
+                .get("_ARRAY_DIMENSIONS")
+                .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())?
+        };
 
-        let lon_axis = dim_names.iter().position(|n| {
-            n.as_ref()
-                .map(|s| matches!(s.as_str(), "lon" | "longitude" | "x"))
-                .unwrap_or(false)
-        })?;
-        let lat_axis = dim_names.iter().position(|n| {
-            n.as_ref()
-                .map(|s| matches!(s.as_str(), "lat" | "latitude" | "y"))
-                .unwrap_or(false)
-        })?;
+        let lon_axis = dim_names
+            .iter()
+            .position(|s| matches!(s.as_str(), "lon" | "longitude" | "x"))?;
+        let lat_axis = dim_names
+            .iter()
+            .position(|s| matches!(s.as_str(), "lat" | "latitude" | "y"))?;
 
-        Some(Self {
-            shape,
-            lon_axis,
-            lat_axis,
-        })
-    }
-
-    fn lon_size(&self) -> usize {
-        self.shape[self.lon_axis] as usize
-    }
-    fn lat_size(&self) -> usize {
-        self.shape[self.lat_axis] as usize
-    }
-
-    fn make_index(&self, lon_idx: usize, lat_idx: usize) -> IxDyn {
-        let mut idx = vec![0; self.shape.len()];
-        idx[self.lon_axis] = lon_idx;
-        idx[self.lat_axis] = lat_idx;
-        IxDyn(&idx)
+        Some(Self { lon_axis, lat_axis })
     }
 }
 
-use anyhow::Result;
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use ratatui::{
-    Terminal,
-    layout::Rect,
-    prelude::CrosstermBackend,
-    style::{Color, Style},
-    widgets::Paragraph,
-};
-
-use camera::Camera;
-use colormap::ColorMap;
-use zarrs_filesystem::FilesystemStore;
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (lat_data, lon_data, temp_data, meta) = load_zarr_data().await?;
+    let zarr_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "data_fire.zarr".to_string());
+    let zarr_data = load_zarr_data(&zarr_path)?;
+
+    // load initial variable with metadata
+    let mut current_var_idx = 0;
+    let (mut data, mut meta) =
+        load_variable_with_meta(&zarr_data.store, &zarr_data.variables[current_var_idx])?;
 
     // terminal setup
     enable_raw_mode()?;
@@ -82,35 +72,70 @@ async fn main() -> Result<()> {
 
     // app state
     let mut should_quit = false;
-    let mut camera = Camera::new(0.0, 0.0, 1.0);
-    let mut mouse_lat_lon: Option<(f64, f64)> = None;
-    let mut clicked_value: Option<f64> = None;
+    // centre camera on data bounds
+    let lat_min = zarr_data
+        .lat_data
+        .first()
+        .unwrap()
+        .min(*zarr_data.lat_data.last().unwrap());
+    let lat_max = zarr_data
+        .lat_data
+        .first()
+        .unwrap()
+        .max(*zarr_data.lat_data.last().unwrap());
+    let lon_min = zarr_data
+        .lon_data
+        .first()
+        .unwrap()
+        .min(*zarr_data.lon_data.last().unwrap());
+    let lon_max = zarr_data
+        .lon_data
+        .first()
+        .unwrap()
+        .max(*zarr_data.lon_data.last().unwrap());
+    let center_lat = (lat_min + lat_max) / 2.0;
+    let center_lon = (lon_min + lon_max) / 2.0;
+    // set initial zoom to fit data in ~80 columns
+    let lat_extent = lat_max - lat_min;
+    let lon_extent = lon_max - lon_min;
+    let initial_zoom = lon_extent.max(lat_extent) / 80.0;
+    let mut camera = Camera::new(center_lat, center_lon, initial_zoom);
+    let mut mouse_lat_lon: Option<(f32, f32)> = None;
+    let mut clicked_value: Option<f32> = None;
+    let mut show_help = false;
 
     // main loop
     while !should_quit {
+        let current_var_name = zarr_data.variables[current_var_idx]
+            .trim_start_matches('/')
+            .to_string();
+
         terminal.draw(|frame| {
             let area = frame.area();
 
-            // find min/max for colour scaling
-            let min_temp = temp_data.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-            let max_temp = temp_data.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+            let status_area = Rect {
+                x: area.x,
+                y: area.height.saturating_sub(1),
+                width: area.width,
+                height: 1,
+            };
 
-            // render each cell as a coloured space
+            let vmin = 0.005;
+            let vmax = 0.3;
 
-            for y in area.top()..area.bottom() {
+            for y in area.top()..area.bottom().saturating_sub(1) {
                 for x in area.left()..area.right() {
-                    // Convert screen position to geographic coordinates using camera
                     let (lat, lon) = camera.screen_to_geo(x, y, area.width, area.height);
 
-                    // Convert geographic to array indices
                     if let Some((lat_idx, lon_idx)) =
-                        camera.geo_to_indices(lat, lon, &lat_data, &lon_data)
+                        camera.geo_to_indices(lat, lon, &zarr_data.lat_data, &zarr_data.lon_data)
                     {
-                        if lon_idx < meta.lon_size() && lat_idx < meta.lat_size() {
-                            let idx = meta.make_index(lon_idx, lat_idx);
-                            let value = temp_data[&idx];
-                            let color = ColorMap::map_value(value, min_temp, max_temp);
+                        let mut idx = vec![0; data.ndim()];
+                        idx[meta.lat_axis] = lat_idx;
+                        idx[meta.lon_axis] = lon_idx;
 
+                        if let Some(&value) = data.get(IxDyn(&idx)) {
+                            let color = ColorMap::map_value(value, vmin, vmax);
                             let cell = frame.buffer_mut().get_mut(x, y);
                             cell.set_char(' ');
                             cell.set_bg(color);
@@ -118,37 +143,65 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+
             // render status bar
-            let status = match (mouse_lat_lon, clicked_value) {
-                (Some((lat, lon)), Some(val)) => {
-                    format!("Lat: {:.2}, Lon: {:.2} | Value: {:.4}", lat, lon, val)
-                }
-                (Some((lat, lon)), None) => format!("Lat: {:.2}, Lon: {:.2}", lat, lon),
-                _ => String::new(),
+            let status_data = StatusBarData {
+                cursor_lat: mouse_lat_lon.map(|(lat, _)| lat),
+                cursor_lon: mouse_lat_lon.map(|(_, lon)| lon),
+                cursor_value: clicked_value,
+                camera_zoom: camera.zoom,
+                variable_name: Some(current_var_name.clone()),
             };
-            let status_widget =
-                Paragraph::new(status).style(Style::default().fg(Color::White).bg(Color::Black));
-            frame.render_widget(
-                status_widget,
-                Rect::new(0, area.height.saturating_sub(1), area.width, 1),
-            );
+            frame.render_widget(StatusBar::new(&status_data), status_area);
+
+            if show_help {
+                frame.render_widget(HelpOverlay::default(), area);
+            }
         })?;
         let area = terminal.get_frame().area();
         while event::poll(std::time::Duration::from_millis(16))? {
             match event::read()? {
                 Event::Key(key) => match key.code {
-                    KeyCode::Char('q') => should_quit = true,
+                    KeyCode::Esc | KeyCode::Char('q') => should_quit = true,
                     KeyCode::Char('+') | KeyCode::Char('=') => camera.zoom_in(),
                     KeyCode::Char('-') => camera.zoom_out(),
-                    KeyCode::Char('r') => camera.reset(),
-                    KeyCode::Left => camera.pan(0.0, -5.0),
-                    KeyCode::Right => camera.pan(0.0, 5.0),
-                    KeyCode::Up => camera.pan(5.0, 0.0),
-                    KeyCode::Down => camera.pan(-5.0, 0.0),
-                    KeyCode::Char('h') => camera.pan(0.0, -5.0),
-                    KeyCode::Char('l') => camera.pan(0.0, 5.0),
-                    KeyCode::Char('k') => camera.pan(5.0, 0.0),
-                    KeyCode::Char('j') => camera.pan(-5.0, 0.0),
+                    KeyCode::Char('r') => camera.set(center_lat, center_lon, initial_zoom),
+                    KeyCode::Left => camera.pan(0.0, -5.0 * camera.zoom),
+                    KeyCode::Right => camera.pan(0.0, 5.0 * camera.zoom),
+                    KeyCode::Up => camera.pan(5.0 * camera.zoom, 0.0),
+                    KeyCode::Down => camera.pan(-5.0 * camera.zoom, 0.0),
+                    KeyCode::Char('h') => camera.pan(0.0, -5.0 * camera.zoom),
+                    KeyCode::Char('l') => camera.pan(0.0, 5.0 * camera.zoom),
+                    KeyCode::Char('k') => camera.pan(5.0 * camera.zoom, 0.0),
+                    KeyCode::Char('j') => camera.pan(-5.0 * camera.zoom, 0.0),
+                    // help
+                    KeyCode::Char('?') => show_help = !show_help,
+                    // variables - switch and reload
+                    KeyCode::Char('[') => {
+                        if !zarr_data.variables.is_empty() {
+                            let len = zarr_data.variables.len();
+                            current_var_idx = (current_var_idx + len - 1) % len;
+                            if let Ok((new_data, new_meta)) = load_variable_with_meta(
+                                &zarr_data.store,
+                                &zarr_data.variables[current_var_idx],
+                            ) {
+                                data = new_data;
+                                meta = new_meta;
+                            }
+                        }
+                    }
+                    KeyCode::Char(']') => {
+                        if !zarr_data.variables.is_empty() {
+                            current_var_idx = (current_var_idx + 1) % zarr_data.variables.len();
+                            if let Ok((new_data, new_meta)) = load_variable_with_meta(
+                                &zarr_data.store,
+                                &zarr_data.variables[current_var_idx],
+                            ) {
+                                data = new_data;
+                                meta = new_meta;
+                            }
+                        }
+                    }
                     _ => {}
                 },
                 Event::Mouse(mouse) => {
@@ -157,14 +210,12 @@ async fn main() -> Result<()> {
                     mouse_lat_lon = Some((lat, lon));
 
                     if let Some((lat_idx, lon_idx)) =
-                        camera.geo_to_indices(lat, lon, &lat_data, &lon_data)
+                        camera.geo_to_indices(lat, lon, &zarr_data.lat_data, &zarr_data.lon_data)
                     {
-                        if lon_idx < meta.lon_size() && lat_idx < meta.lat_size() {
-                            let idx = meta.make_index(lon_idx, lat_idx);
-                            clicked_value = Some(temp_data[&idx]);
-                        } else {
-                            clicked_value = None;
-                        }
+                        let mut idx = vec![0; data.ndim()];
+                        idx[meta.lat_axis] = lat_idx;
+                        idx[meta.lon_axis] = lon_idx;
+                        clicked_value = data.get(IxDyn(&idx)).copied();
                     } else {
                         clicked_value = None;
                     }
@@ -184,32 +235,192 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn load_zarr_data() -> Result<(Vec<f32>, Vec<f32>, ArrayD<f64>, ArrayMeta)> {
-    // let path = "sample.zarr";
-    let path = "data.zarr";
+/// Load a 1D coordinate array, converting to f32 regardless of source type
+fn load_coord_array(store: &Arc<FilesystemStore>, path: &str) -> Result<Vec<f32>> {
+    use zarrs::array::DataType;
+
+    let array = Array::open(store.clone(), path)?;
+    let shape = array.shape().to_vec();
+    let subset = ArraySubset::new_with_shape(shape);
+
+    let data: Vec<f32> = match array.data_type() {
+        DataType::Float32 => {
+            let arr: ArrayD<f32> = array.retrieve_array_subset_ndarray(&subset)?;
+            arr.iter().copied().collect()
+        }
+        DataType::Float64 => {
+            let arr: ArrayD<f64> = array.retrieve_array_subset_ndarray(&subset)?;
+            arr.iter().map(|&v| v as f32).collect()
+        }
+        DataType::Int32 => {
+            let arr: ArrayD<i32> = array.retrieve_array_subset_ndarray(&subset)?;
+            arr.iter().map(|&v| v as f32).collect()
+        }
+        DataType::Int64 => {
+            let arr: ArrayD<i64> = array.retrieve_array_subset_ndarray(&subset)?;
+            arr.iter().map(|&v| v as f32).collect()
+        }
+        dt => anyhow::bail!("Unsupported coordinate data type: {:?}", dt),
+    };
+
+    Ok(data)
+}
+
+/// Load a variable array, converting to f32 regardless of source type
+fn load_variable_array(store: &Arc<FilesystemStore>, path: &str) -> Result<ArrayD<f32>> {
+    use zarrs::array::DataType;
+
+    let array = Array::open(store.clone(), path)?;
+    let shape = array.shape().to_vec();
+    let subset = ArraySubset::new_with_shape(shape);
+
+    let data: ArrayD<f32> = match array.data_type() {
+        DataType::Float32 => array.retrieve_array_subset_ndarray(&subset)?,
+        DataType::Float64 => {
+            let arr: ArrayD<f64> = array.retrieve_array_subset_ndarray(&subset)?;
+            arr.mapv(|v| v as f32)
+        }
+        DataType::Int32 => {
+            let arr: ArrayD<i32> = array.retrieve_array_subset_ndarray(&subset)?;
+            arr.mapv(|v| v as f32)
+        }
+        DataType::Int64 => {
+            let arr: ArrayD<i64> = array.retrieve_array_subset_ndarray(&subset)?;
+            arr.mapv(|v| v as f32)
+        }
+        DataType::UInt8 => {
+            let arr: ArrayD<u8> = array.retrieve_array_subset_ndarray(&subset)?;
+            arr.mapv(|v| v as f32)
+        }
+        DataType::UInt16 => {
+            let arr: ArrayD<u16> = array.retrieve_array_subset_ndarray(&subset)?;
+            arr.mapv(|v| v as f32)
+        }
+        dt => anyhow::bail!("Unsupported variable data type: {:?}", dt),
+    };
+
+    Ok(data)
+}
+
+/// Names that indicate coordinate arrays (not data variables)
+const COORD_NAMES: &[&str] = &[
+    "lat",
+    "latitude",
+    "lon",
+    "longitude",
+    "x",
+    "y",
+    "time",
+    "level",
+    "crs",
+    "spatial_ref",
+    "year",
+    "month",
+];
+
+/// Discover all arrays in a zarr store
+fn discover_arrays(
+    _store: &Arc<FilesystemStore>,
+    base_path: &std::path::Path,
+) -> Result<Vec<String>> {
+    use std::fs;
+
+    let mut arrays = Vec::new();
+
+    for entry in fs::read_dir(base_path)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            // skip hidden directories and zarr metadata
+            if name.starts_with('.') || name == "__pycache__" {
+                continue;
+            }
+
+            // check if this is a zarr array (has .zarray or zarr.json)
+            let is_zarr_array = path.join(".zarray").exists() || path.join("zarr.json").exists();
+
+            if is_zarr_array {
+                arrays.push(format!("/{}", name));
+            }
+        }
+    }
+
+    arrays.sort();
+    Ok(arrays)
+}
+
+/// Filter arrays to find coordinate arrays
+fn find_coord_array(arrays: &[String], names: &[&str]) -> Option<String> {
+    for name in names {
+        let path = format!("/{}", name);
+        if arrays.contains(&path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Filter arrays to find data variables (non-coordinate arrays)
+fn find_data_variables(arrays: &[String]) -> Vec<String> {
+    arrays
+        .iter()
+        .filter(|name| {
+            let base = name.trim_start_matches('/').to_lowercase();
+            !COORD_NAMES.contains(&base.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+/// Loaded zarr dataset
+struct ZarrData {
+    store: Arc<FilesystemStore>,
+    lat_data: Vec<f32>,
+    lon_data: Vec<f32>,
+    variables: Vec<String>,
+}
+
+fn load_zarr_data(path: &str) -> Result<ZarrData> {
+    let base_path = std::path::Path::new(path);
     let store = Arc::new(FilesystemStore::new(path)?);
 
-    let lat_array = Array::open(store.clone(), "/latitude")?;
-    let lat_shape = lat_array.shape().to_vec();
-    let lat: ArrayD<f32> =
-        lat_array.retrieve_array_subset_ndarray(&ArraySubset::new_with_shape(lat_shape))?;
+    // discover arrays
+    let arrays = discover_arrays(&store, base_path)?;
 
-    let lon_array = Array::open(store.clone(), "/longitude")?;
-    let lon_shape = lon_array.shape().to_vec();
-    let lon: ArrayD<f32> =
-        lon_array.retrieve_array_subset_ndarray(&ArraySubset::new_with_shape(lon_shape))?;
+    // find coordinate arrays
+    let lat_path = find_coord_array(&arrays, &["latitude", "lat", "y"])
+        .ok_or_else(|| anyhow::anyhow!("No latitude coordinate found"))?;
+    let lon_path = find_coord_array(&arrays, &["longitude", "lon", "x"])
+        .ok_or_else(|| anyhow::anyhow!("No longitude coordinate found"))?;
 
-    let temp_array = Array::open(store.clone(), "/cat3_probability")?;
-    let meta = ArrayMeta::from_array(&temp_array)
-        .ok_or_else(|| anyhow::anyhow!("Missing dimension names (lon/lat) in array metadata"))?;
-    let shape = temp_array.shape().to_vec();
-    let temp: ArrayD<f64> =
-        temp_array.retrieve_array_subset_ndarray(&ArraySubset::new_with_shape(shape))?;
+    let lat_data = load_coord_array(&store, &lat_path)?;
+    let lon_data = load_coord_array(&store, &lon_path)?;
 
-    Ok((
-        lat.iter().copied().collect(),
-        lon.iter().copied().collect(),
-        temp,
-        meta,
-    ))
+    // find data variables
+    let variables = find_data_variables(&arrays);
+    if variables.is_empty() {
+        anyhow::bail!("No data variables found in zarr store");
+    }
+
+    Ok(ZarrData {
+        store,
+        lat_data,
+        lon_data,
+        variables,
+    })
+}
+
+/// Load a variable array with its metadata
+fn load_variable_with_meta(
+    store: &Arc<FilesystemStore>,
+    path: &str,
+) -> Result<(ArrayD<f32>, ArrayMeta)> {
+    let array = Array::open(store.clone(), path)?;
+    let meta = ArrayMeta::from_array(&array)
+        .ok_or_else(|| anyhow::anyhow!("Missing dimension names in {}", path))?;
+    let data = load_variable_array(store, path)?;
+    Ok((data, meta))
 }
