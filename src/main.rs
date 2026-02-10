@@ -2,11 +2,10 @@ mod camera;
 mod colormap;
 mod ui;
 mod zarr;
-use ui::{HelpOverlay, StatusBar, StatusBarData};
+use ui::{Colorbar, HelpOverlay, StatusBar, StatusBarData};
 
-use ndarray::{ArrayD, IxDyn};
-use std::{io, sync::Arc};
-use zarrs::{array::Array, array_subset::ArraySubset};
+use std::collections::HashMap;
+use std::io;
 
 use anyhow::Result;
 use crossterm::{
@@ -17,51 +16,63 @@ use crossterm::{
 use ratatui::{Terminal, layout::Rect, prelude::CrosstermBackend};
 
 use camera::Camera;
-use colormap::ColorMap;
-use zarrs_filesystem::FilesystemStore;
+use colormap::{ColorMap, ColormapType};
+use zarr::chunk_manager::{ChunkManager, visible_chunks};
+use zarr::storage::{OpenArray, UnifiedStore};
 
-struct ArrayMeta {
-    lon_axis: usize,
-    lat_axis: usize,
-}
-
-impl ArrayMeta {
-    fn from_array<TStorage: zarrs::storage::ReadableStorageTraits + ?Sized>(
-        array: &Array<TStorage>,
-    ) -> Option<Self> {
-        // zarr v3: native dimension_names in array metadata
-        let dim_names: Vec<String> = if let Some(names) = array.dimension_names() {
-            names.iter().filter_map(|n| n.clone()).collect()
-        } else {
-            // zarr v2: xarray stores dimension names in _ARRAY_DIMENSIONS attr
-            array
-                .attributes()
-                .get("_ARRAY_DIMENSIONS")
-                .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())?
-        };
-
-        let lon_axis = dim_names
-            .iter()
-            .position(|s| matches!(s.as_str(), "lon" | "longitude" | "x"))?;
-        let lat_axis = dim_names
-            .iter()
-            .position(|s| matches!(s.as_str(), "lat" | "latitude" | "y"))?;
-
-        Some(Self { lon_axis, lat_axis })
-    }
-}
+const DEFAULT_CHUNK_SIZE: usize = 256;
+const CACHE_CAPACITY: usize = 512;
+const MAX_CHUNKS_PER_FRAME: usize = 1;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let zarr_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "data_fire.zarr".to_string());
-    let zarr_data = load_zarr_data(&zarr_path)?;
 
-    // load initial variable with metadata
+    eprintln!("Loading zarr from: {}", zarr_path);
+    let mut zarr_data = load_zarr_data(&zarr_path).await?;
+    eprintln!(
+        "Found {} variables: {:?}",
+        zarr_data.variables.len(),
+        zarr_data.variables
+    );
+
+    // open initial variable
     let mut current_var_idx = 0;
-    let (mut data, mut meta) =
-        load_variable_with_meta(&zarr_data.store, &zarr_data.variables[current_var_idx])?;
+    let current_var_path = &zarr_data.variables[current_var_idx];
+    eprintln!("Opening variable: {}", current_var_path);
+
+    // open array and get metadata
+    let open_array = zarr_data.store.open_array(current_var_path)?;
+    let meta = open_array
+        .meta()
+        .ok_or_else(|| anyhow::anyhow!("Missing dimension names for {}", current_var_path))?;
+    let ndim = open_array.shape().len();
+
+    // Use native chunk shape if available, otherwise default
+    if let Some((native_lat, native_lon)) =
+        open_array.native_chunk_shape(meta.lat_axis, meta.lon_axis)
+    {
+        eprintln!("  Using native chunk size: {}x{}", native_lat, native_lon);
+        zarr_data.chunk_manager.chunk_size_lat = native_lat;
+        zarr_data.chunk_manager.chunk_size_lon = native_lon;
+    }
+
+    zarr_data
+        .open_arrays
+        .insert(current_var_path.clone(), open_array);
+
+    let mut current_meta = meta;
+    let mut current_ndim = ndim;
+
+    let chunk_lat = zarr_data.chunk_manager.chunk_size_lat;
+    let chunk_lon = zarr_data.chunk_manager.chunk_size_lon;
+    let estimated_chunk_mb = (chunk_lat * chunk_lon * 4) as f64 / (1024.0 * 1024.0);
+    eprintln!(
+        "Ready for lazy loading (chunk size: {}x{}, ~{:.1}MB per chunk)",
+        chunk_lat, chunk_lon, estimated_chunk_mb
+    );
 
     // terminal setup
     enable_raw_mode()?;
@@ -103,12 +114,54 @@ async fn main() -> Result<()> {
     let mut mouse_lat_lon: Option<(f32, f32)> = None;
     let mut clicked_value: Option<f32> = None;
     let mut show_help = false;
+    let mut visible_chunk_count: usize;
+    let mut current_colormap = ColormapType::Viridis;
 
     // main loop
     while !should_quit {
-        let current_var_name = zarr_data.variables[current_var_idx]
-            .trim_start_matches('/')
-            .to_string();
+        let current_var_path = &zarr_data.variables[current_var_idx];
+        let current_var_name = current_var_path.trim_start_matches('/').to_string();
+
+        // calculate viewport bounds
+        let area = terminal.get_frame().area();
+        let (top_lat, left_lon) = camera.screen_to_geo(0, 0, area.width, area.height);
+        let (bottom_lat, right_lon) = camera.screen_to_geo(
+            area.width,
+            area.height.saturating_sub(1),
+            area.width,
+            area.height,
+        );
+        let view_lat_min = top_lat.min(bottom_lat);
+        let view_lat_max = top_lat.max(bottom_lat);
+        let view_lon_min = left_lon.min(right_lon);
+        let view_lon_max = left_lon.max(right_lon);
+
+        // get visible chunks
+        let chunks = visible_chunks(
+            view_lat_min,
+            view_lat_max,
+            view_lon_min,
+            view_lon_max,
+            &zarr_data.lat_data,
+            &zarr_data.lon_data,
+            zarr_data.chunk_manager.chunk_size_lat,
+            zarr_data.chunk_manager.chunk_size_lon,
+        );
+        visible_chunk_count = chunks.len();
+
+        // load visible chunks (limited per frame to keep UI responsive)
+        if let Some(array) = zarr_data.open_arrays.get(current_var_path) {
+            zarr_data.chunk_manager.load_visible_chunks_limited(
+                current_var_path,
+                0, // time_idx
+                &chunks,
+                array,
+                current_meta.lat_axis,
+                current_meta.lon_axis,
+                current_ndim,
+                MAX_CHUNKS_PER_FRAME,
+            );
+        }
 
         terminal.draw(|frame| {
             let area = frame.area();
@@ -120,29 +173,84 @@ async fn main() -> Result<()> {
                 height: 1,
             };
 
+            // Colorbar on right side
+            let colorbar_width = 12;
+            let colorbar_area = Rect {
+                x: area.width.saturating_sub(colorbar_width),
+                y: area.y,
+                width: colorbar_width,
+                height: area.height.saturating_sub(1),
+            };
+            let map_width = area.width.saturating_sub(colorbar_width);
+
             let vmin = 0.005;
             let vmax = 0.3;
 
+            // Check if we need to use block averaging (when zoomed out)
+            let points_per_pixel =
+                camera.data_points_per_pixel(&zarr_data.lat_data, &zarr_data.lon_data);
+            let use_averaging = points_per_pixel > 1.5;
+
             for y in area.top()..area.bottom().saturating_sub(1) {
-                for x in area.left()..area.right() {
-                    let (lat, lon) = camera.screen_to_geo(x, y, area.width, area.height);
-
-                    if let Some((lat_idx, lon_idx)) =
-                        camera.geo_to_indices(lat, lon, &zarr_data.lat_data, &zarr_data.lon_data)
-                    {
-                        let mut idx = vec![0; data.ndim()];
-                        idx[meta.lat_axis] = lat_idx;
-                        idx[meta.lon_axis] = lon_idx;
-
-                        if let Some(&value) = data.get(IxDyn(&idx)) {
-                            let color = ColorMap::map_value(value, vmin, vmax);
-                            let cell = frame.buffer_mut().get_mut(x, y);
-                            cell.set_char(' ');
-                            cell.set_bg(color);
+                for x in area.left()..map_width {
+                    let value = if use_averaging {
+                        // Block averaging for zoomed-out view
+                        if let Some(((lat_start, lat_end), (lon_start, lon_end))) = camera
+                            .pixel_to_index_range(
+                                x,
+                                y,
+                                map_width,
+                                area.height,
+                                &zarr_data.lat_data,
+                                &zarr_data.lon_data,
+                            )
+                        {
+                            zarr_data.chunk_manager.get_averaged_value_if_cached(
+                                current_var_path,
+                                0,
+                                (lat_start, lat_end),
+                                (lon_start, lon_end),
+                                current_meta.lat_axis,
+                                current_meta.lon_axis,
+                                current_ndim,
+                            )
+                        } else {
+                            None
                         }
+                    } else {
+                        // Nearest neighbor for zoomed-in view
+                        let (lat, lon) = camera.screen_to_geo(x, y, map_width, area.height);
+                        if let Some((lat_idx, lon_idx)) = camera.geo_to_indices(
+                            lat,
+                            lon,
+                            &zarr_data.lat_data,
+                            &zarr_data.lon_data,
+                        ) {
+                            zarr_data.chunk_manager.get_value_if_cached(
+                                current_var_path,
+                                0,
+                                lat_idx,
+                                lon_idx,
+                                current_meta.lat_axis,
+                                current_meta.lon_axis,
+                                current_ndim,
+                            )
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(v) = value {
+                        let color = ColorMap::map_value(v, vmin, vmax, current_colormap);
+                        let cell = &mut frame.buffer_mut()[(x, y)];
+                        cell.set_char(' ');
+                        cell.set_bg(color);
                     }
                 }
             }
+
+            // Render colorbar
+            frame.render_widget(Colorbar::new(vmin, vmax, current_colormap), colorbar_area);
 
             // render status bar
             let status_data = StatusBarData {
@@ -151,6 +259,9 @@ async fn main() -> Result<()> {
                 cursor_value: clicked_value,
                 camera_zoom: camera.zoom,
                 variable_name: Some(current_var_name.clone()),
+                cached_chunks: Some(zarr_data.chunk_manager.cache_len()),
+                visible_chunks: Some(visible_chunk_count),
+                pending_chunks: Some(zarr_data.chunk_manager.pending_chunks),
             };
             frame.render_widget(StatusBar::new(&status_data), status_area);
 
@@ -158,8 +269,14 @@ async fn main() -> Result<()> {
                 frame.render_widget(HelpOverlay::default(), area);
             }
         })?;
+
         let area = terminal.get_frame().area();
-        while event::poll(std::time::Duration::from_millis(16))? {
+        let poll_timeout = if zarr_data.chunk_manager.pending_chunks > 0 {
+            std::time::Duration::from_millis(16)
+        } else {
+            std::time::Duration::from_millis(100)
+        };
+        while event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key) => match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => should_quit = true,
@@ -176,29 +293,50 @@ async fn main() -> Result<()> {
                     KeyCode::Char('j') => camera.pan(-5.0 * camera.zoom, 0.0),
                     // help
                     KeyCode::Char('?') => show_help = !show_help,
-                    // variables - switch and reload
+                    // colormaps - cycle with c/C
+                    KeyCode::Char('c') => current_colormap = current_colormap.next(),
+                    KeyCode::Char('C') => current_colormap = current_colormap.prev(),
+                    // variables - switch (chunks loaded on demand, cache keyed by var name)
                     KeyCode::Char('[') => {
                         if !zarr_data.variables.is_empty() {
                             let len = zarr_data.variables.len();
                             current_var_idx = (current_var_idx + len - 1) % len;
-                            if let Ok((new_data, new_meta)) = load_variable_with_meta(
-                                &zarr_data.store,
-                                &zarr_data.variables[current_var_idx],
-                            ) {
-                                data = new_data;
-                                meta = new_meta;
+                            let var_path = &zarr_data.variables[current_var_idx];
+
+                            // open array if not already cached
+                            if !zarr_data.open_arrays.contains_key(var_path) {
+                                if let Ok(arr) = zarr_data.store.open_array(var_path) {
+                                    zarr_data.open_arrays.insert(var_path.clone(), arr);
+                                }
+                            }
+
+                            // update metadata
+                            if let Some(arr) = zarr_data.open_arrays.get(var_path) {
+                                if let Some(meta) = arr.meta() {
+                                    current_meta = meta;
+                                    current_ndim = arr.shape().len();
+                                }
                             }
                         }
                     }
                     KeyCode::Char(']') => {
                         if !zarr_data.variables.is_empty() {
                             current_var_idx = (current_var_idx + 1) % zarr_data.variables.len();
-                            if let Ok((new_data, new_meta)) = load_variable_with_meta(
-                                &zarr_data.store,
-                                &zarr_data.variables[current_var_idx],
-                            ) {
-                                data = new_data;
-                                meta = new_meta;
+                            let var_path = &zarr_data.variables[current_var_idx];
+
+                            // open array if not already cached
+                            if !zarr_data.open_arrays.contains_key(var_path) {
+                                if let Ok(arr) = zarr_data.store.open_array(var_path) {
+                                    zarr_data.open_arrays.insert(var_path.clone(), arr);
+                                }
+                            }
+
+                            // update metadata
+                            if let Some(arr) = zarr_data.open_arrays.get(var_path) {
+                                if let Some(meta) = arr.meta() {
+                                    current_meta = meta;
+                                    current_ndim = arr.shape().len();
+                                }
                             }
                         }
                     }
@@ -209,13 +347,19 @@ async fn main() -> Result<()> {
                         camera.screen_to_geo(mouse.column, mouse.row, area.width, area.height);
                     mouse_lat_lon = Some((lat, lon));
 
+                    // use chunk manager for value lookup
                     if let Some((lat_idx, lon_idx)) =
                         camera.geo_to_indices(lat, lon, &zarr_data.lat_data, &zarr_data.lon_data)
                     {
-                        let mut idx = vec![0; data.ndim()];
-                        idx[meta.lat_axis] = lat_idx;
-                        idx[meta.lon_axis] = lon_idx;
-                        clicked_value = data.get(IxDyn(&idx)).copied();
+                        clicked_value = zarr_data.chunk_manager.get_value_if_cached(
+                            current_var_path,
+                            0,
+                            lat_idx,
+                            lon_idx,
+                            current_meta.lat_axis,
+                            current_meta.lon_axis,
+                            current_ndim,
+                        );
                     } else {
                         clicked_value = None;
                     }
@@ -224,6 +368,7 @@ async fn main() -> Result<()> {
             }
         }
     }
+
     // restore terminal
     disable_raw_mode()?;
     execute!(
@@ -233,73 +378,6 @@ async fn main() -> Result<()> {
     )?;
     terminal.show_cursor()?;
     Ok(())
-}
-
-/// Load a 1D coordinate array, converting to f32 regardless of source type
-fn load_coord_array(store: &Arc<FilesystemStore>, path: &str) -> Result<Vec<f32>> {
-    use zarrs::array::DataType;
-
-    let array = Array::open(store.clone(), path)?;
-    let shape = array.shape().to_vec();
-    let subset = ArraySubset::new_with_shape(shape);
-
-    let data: Vec<f32> = match array.data_type() {
-        DataType::Float32 => {
-            let arr: ArrayD<f32> = array.retrieve_array_subset_ndarray(&subset)?;
-            arr.iter().copied().collect()
-        }
-        DataType::Float64 => {
-            let arr: ArrayD<f64> = array.retrieve_array_subset_ndarray(&subset)?;
-            arr.iter().map(|&v| v as f32).collect()
-        }
-        DataType::Int32 => {
-            let arr: ArrayD<i32> = array.retrieve_array_subset_ndarray(&subset)?;
-            arr.iter().map(|&v| v as f32).collect()
-        }
-        DataType::Int64 => {
-            let arr: ArrayD<i64> = array.retrieve_array_subset_ndarray(&subset)?;
-            arr.iter().map(|&v| v as f32).collect()
-        }
-        dt => anyhow::bail!("Unsupported coordinate data type: {:?}", dt),
-    };
-
-    Ok(data)
-}
-
-/// Load a variable array, converting to f32 regardless of source type
-fn load_variable_array(store: &Arc<FilesystemStore>, path: &str) -> Result<ArrayD<f32>> {
-    use zarrs::array::DataType;
-
-    let array = Array::open(store.clone(), path)?;
-    let shape = array.shape().to_vec();
-    let subset = ArraySubset::new_with_shape(shape);
-
-    let data: ArrayD<f32> = match array.data_type() {
-        DataType::Float32 => array.retrieve_array_subset_ndarray(&subset)?,
-        DataType::Float64 => {
-            let arr: ArrayD<f64> = array.retrieve_array_subset_ndarray(&subset)?;
-            arr.mapv(|v| v as f32)
-        }
-        DataType::Int32 => {
-            let arr: ArrayD<i32> = array.retrieve_array_subset_ndarray(&subset)?;
-            arr.mapv(|v| v as f32)
-        }
-        DataType::Int64 => {
-            let arr: ArrayD<i64> = array.retrieve_array_subset_ndarray(&subset)?;
-            arr.mapv(|v| v as f32)
-        }
-        DataType::UInt8 => {
-            let arr: ArrayD<u8> = array.retrieve_array_subset_ndarray(&subset)?;
-            arr.mapv(|v| v as f32)
-        }
-        DataType::UInt16 => {
-            let arr: ArrayD<u16> = array.retrieve_array_subset_ndarray(&subset)?;
-            arr.mapv(|v| v as f32)
-        }
-        dt => anyhow::bail!("Unsupported variable data type: {:?}", dt),
-    };
-
-    Ok(data)
 }
 
 /// Names that indicate coordinate arrays (not data variables)
@@ -317,40 +395,6 @@ const COORD_NAMES: &[&str] = &[
     "year",
     "month",
 ];
-
-/// Discover all arrays in a zarr store
-fn discover_arrays(
-    _store: &Arc<FilesystemStore>,
-    base_path: &std::path::Path,
-) -> Result<Vec<String>> {
-    use std::fs;
-
-    let mut arrays = Vec::new();
-
-    for entry in fs::read_dir(base_path)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-            // skip hidden directories and zarr metadata
-            if name.starts_with('.') || name == "__pycache__" {
-                continue;
-            }
-
-            // check if this is a zarr array (has .zarray or zarr.json)
-            let is_zarr_array = path.join(".zarray").exists() || path.join("zarr.json").exists();
-
-            if is_zarr_array {
-                arrays.push(format!("/{}", name));
-            }
-        }
-    }
-
-    arrays.sort();
-    Ok(arrays)
-}
 
 /// Filter arrays to find coordinate arrays
 fn find_coord_array(arrays: &[String], names: &[&str]) -> Option<String> {
@@ -375,20 +419,24 @@ fn find_data_variables(arrays: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Loaded zarr dataset
+/// Loaded zarr dataset with lazy chunk loading
 struct ZarrData {
-    store: Arc<FilesystemStore>,
+    store: UnifiedStore,
     lat_data: Vec<f32>,
     lon_data: Vec<f32>,
     variables: Vec<String>,
+    open_arrays: HashMap<String, OpenArray>,
+    chunk_manager: ChunkManager,
 }
 
-fn load_zarr_data(path: &str) -> Result<ZarrData> {
-    let base_path = std::path::Path::new(path);
-    let store = Arc::new(FilesystemStore::new(path)?);
+async fn load_zarr_data(path: &str) -> Result<ZarrData> {
+    eprintln!("  Opening store...");
+    let store = UnifiedStore::open(path)?;
 
     // discover arrays
-    let arrays = discover_arrays(&store, base_path)?;
+    eprintln!("  Discovering arrays...");
+    let arrays = store.discover_arrays().await?;
+    eprintln!("  Found {} arrays", arrays.len());
 
     // find coordinate arrays
     let lat_path = find_coord_array(&arrays, &["latitude", "lat", "y"])
@@ -396,8 +444,10 @@ fn load_zarr_data(path: &str) -> Result<ZarrData> {
     let lon_path = find_coord_array(&arrays, &["longitude", "lon", "x"])
         .ok_or_else(|| anyhow::anyhow!("No longitude coordinate found"))?;
 
-    let lat_data = load_coord_array(&store, &lat_path)?;
-    let lon_data = load_coord_array(&store, &lon_path)?;
+    eprintln!("  Loading coordinates...");
+    let lat_data = store.load_coord_array(&lat_path)?;
+    let lon_data = store.load_coord_array(&lon_path)?;
+    eprintln!("  Coordinates: {}x{}", lat_data.len(), lon_data.len());
 
     // find data variables
     let variables = find_data_variables(&arrays);
@@ -405,22 +455,21 @@ fn load_zarr_data(path: &str) -> Result<ZarrData> {
         anyhow::bail!("No data variables found in zarr store");
     }
 
+    // create chunk manager (will be updated with native chunk size when array is opened)
+    let chunk_manager = ChunkManager::new(
+        DEFAULT_CHUNK_SIZE,
+        DEFAULT_CHUNK_SIZE,
+        lat_data.len(),
+        lon_data.len(),
+        CACHE_CAPACITY,
+    );
+
     Ok(ZarrData {
         store,
         lat_data,
         lon_data,
         variables,
+        open_arrays: HashMap::new(),
+        chunk_manager,
     })
-}
-
-/// Load a variable array with its metadata
-fn load_variable_with_meta(
-    store: &Arc<FilesystemStore>,
-    path: &str,
-) -> Result<(ArrayD<f32>, ArrayMeta)> {
-    let array = Array::open(store.clone(), path)?;
-    let meta = ArrayMeta::from_array(&array)
-        .ok_or_else(|| anyhow::anyhow!("Missing dimension names in {}", path))?;
-    let data = load_variable_array(store, path)?;
-    Ok((data, meta))
 }

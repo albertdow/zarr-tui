@@ -40,12 +40,6 @@ impl Camera {
         self.zoom = zoom;
     }
 
-    pub fn reset(&mut self) {
-        self.center_lat = 0.0;
-        self.center_lon = 0.0;
-        self.zoom = 1.0;
-    }
-
     pub fn screen_to_geo(
         &self,
         screen_x: u16,
@@ -76,6 +70,65 @@ impl Camera {
         let lat_idx = binary_search_nearest(lat_coords, lat)?;
         let lon_idx = binary_search_nearest(lon_coords, lon)?;
         Some((lat_idx, lon_idx))
+    }
+
+    /// Get the range of data indices that a screen pixel covers.
+    /// Returns ((lat_start, lat_end), (lon_start, lon_end)) as exclusive ranges.
+    /// When zoomed in (pixel covers < 1 data point), returns single-element range.
+    pub fn pixel_to_index_range(
+        &self,
+        screen_x: u16,
+        screen_y: u16,
+        screen_width: u16,
+        screen_height: u16,
+        lat_coords: &[f32],
+        lon_coords: &[f32],
+    ) -> Option<((usize, usize), (usize, usize))> {
+        // get geo bounds for this pixel (corners)
+        let (lat0, lon0) = self.screen_to_geo(screen_x, screen_y, screen_width, screen_height);
+        let (lat1, lon1) =
+            self.screen_to_geo(screen_x + 1, screen_y + 1, screen_width, screen_height);
+
+        let lat_min = lat0.min(lat1);
+        let lat_max = lat0.max(lat1);
+        let lon_min = lon0.min(lon1);
+        let lon_max = lon0.max(lon1);
+
+        // find index ranges
+        let lat_idx_min = binary_search_nearest(lat_coords, lat_min)?;
+        let lat_idx_max = binary_search_nearest(lat_coords, lat_max)?;
+        let lon_idx_min = binary_search_nearest(lon_coords, lon_min)?;
+        let lon_idx_max = binary_search_nearest(lon_coords, lon_max)?;
+
+        // ensure min <= max (handles descending coords)
+        let (lat_start, lat_end) = (
+            lat_idx_min.min(lat_idx_max),
+            lat_idx_min.max(lat_idx_max) + 1,
+        );
+        let (lon_start, lon_end) = (
+            lon_idx_min.min(lon_idx_max),
+            lon_idx_min.max(lon_idx_max) + 1,
+        );
+
+        Some(((lat_start, lat_end), (lon_start, lon_end)))
+    }
+
+    /// Calculate how many data points per screen pixel (for deciding sampling strategy)
+    pub fn data_points_per_pixel(&self, lat_coords: &[f32], lon_coords: &[f32]) -> f32 {
+        if lat_coords.len() < 2 || lon_coords.len() < 2 {
+            return 1.0;
+        }
+        // average spacing in coords
+        let lat_span = (lat_coords[0] - lat_coords[lat_coords.len() - 1]).abs();
+        let lon_span = (lon_coords[0] - lon_coords[lon_coords.len() - 1]).abs();
+        let lat_spacing = lat_span / lat_coords.len() as f32;
+        let lon_spacing = lon_span / lon_coords.len() as f32;
+
+        // zoom is degrees per pixel
+        let points_per_pixel_lat = self.zoom / lat_spacing;
+        let points_per_pixel_lon = self.zoom / lon_spacing;
+
+        points_per_pixel_lat.max(points_per_pixel_lon)
     }
 }
 
