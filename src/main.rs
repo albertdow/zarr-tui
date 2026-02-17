@@ -192,7 +192,7 @@ async fn main() -> Result<()> {
             for y in area.top()..area.bottom().saturating_sub(1) {
                 for x in area.left()..map_width {
                     let value = if use_averaging {
-                        // Block averaging for zoomed-out view
+                        // block averaging for zoomed-out view
                         if let Some(((lat_start, lat_end), (lon_start, lon_end))) = camera
                             .pixel_to_index_range(
                                 x,
@@ -216,7 +216,7 @@ async fn main() -> Result<()> {
                             None
                         }
                     } else {
-                        // Nearest neighbor for zoomed-in view
+                        // nearest neighbour for zoomed-in view
                         let (lat, lon) = camera.screen_to_geo(x, y, map_width, area.height);
                         if let Some((lat_idx, lon_idx)) = camera.geo_to_indices(
                             lat,
