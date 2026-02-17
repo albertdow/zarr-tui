@@ -65,10 +65,7 @@ impl ChunkManager {
 
     /// Convert array indices to chunk indices
     pub fn indices_to_chunk(&self, lat_idx: usize, lon_idx: usize) -> (usize, usize) {
-        (
-            lat_idx / self.chunk_size_lat,
-            lon_idx / self.chunk_size_lon,
-        )
+        (lat_idx / self.chunk_size_lat, lon_idx / self.chunk_size_lon)
     }
 
     /// Convert chunk indices to array index range (clamped to total size)
@@ -129,8 +126,13 @@ impl ChunkManager {
             let center_lat = (lat_start + lat_end) / 2;
             let center_lon = (lon_start + lon_end) / 2;
             return self.get_value_if_cached(
-                variable_name, time_idx, center_lat, center_lon,
-                lat_axis, lon_axis, ndim,
+                variable_name,
+                time_idx,
+                center_lat,
+                center_lon,
+                lat_axis,
+                lon_axis,
+                ndim,
             );
         }
 
@@ -172,8 +174,13 @@ impl ChunkManager {
             let center_lat = (lat_start + lat_end) / 2;
             let center_lon = (lon_start + lon_end) / 2;
             self.get_value_if_cached(
-                variable_name, time_idx, center_lat, center_lon,
-                lat_axis, lon_axis, ndim,
+                variable_name,
+                time_idx,
+                center_lat,
+                center_lon,
+                lat_axis,
+                lon_axis,
+                ndim,
             )
         }
     }
@@ -190,7 +197,14 @@ impl ChunkManager {
         ndim: usize,
     ) {
         self.load_visible_chunks_limited(
-            variable_name, time_idx, chunks, array, lat_axis, lon_axis, ndim, usize::MAX,
+            variable_name,
+            time_idx,
+            chunks,
+            array,
+            lat_axis,
+            lon_axis,
+            ndim,
+            usize::MAX,
         );
     }
 
@@ -268,19 +282,9 @@ impl ChunkManager {
         self.pending_chunks = pending;
     }
 
-    /// Check if chunk is cached
-    pub fn is_cached(&self, key: &ChunkKey) -> bool {
-        self.cache.contains(key)
-    }
-
     /// Current cache size
     pub fn cache_len(&self) -> usize {
         self.cache.len()
-    }
-
-    /// Clear the cache
-    pub fn clear(&mut self) {
-        self.cache.clear();
     }
 }
 

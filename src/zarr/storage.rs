@@ -4,9 +4,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::StreamExt;
 use ndarray::ArrayD;
+use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use object_store::prefix::PrefixStore;
-use object_store::ObjectStore;
 use zarrs::array::{Array, DataType};
 use zarrs::array_subset::ArraySubset;
 use zarrs::storage::ReadableStorageTraits;
@@ -16,8 +16,10 @@ use zarrs_storage::storage_adapter::async_to_sync::{
     AsyncToSyncBlockOn, AsyncToSyncStorageAdapter,
 };
 
+const AWS_DEFAULT_REGION: &str = "eu-west-2";
+
 /// Tokio runtime blocker for async-to-sync conversion
-pub(crate) struct TokioBlockOn(tokio::runtime::Handle);
+pub struct TokioBlockOn(tokio::runtime::Handle);
 
 impl AsyncToSyncBlockOn for TokioBlockOn {
     fn block_on<F: core::future::Future>(&self, future: F) -> F::Output {
@@ -26,9 +28,9 @@ impl AsyncToSyncBlockOn for TokioBlockOn {
     }
 }
 
-pub(crate) type S3ObjectStore = PrefixStore<object_store::aws::AmazonS3>;
-pub(crate) type S3AsyncStore = AsyncObjectStore<S3ObjectStore>;
-pub(crate) type S3Store = AsyncToSyncStorageAdapter<S3AsyncStore, TokioBlockOn>;
+pub type S3ObjectStore = PrefixStore<object_store::aws::AmazonS3>;
+pub type S3AsyncStore = AsyncObjectStore<S3ObjectStore>;
+pub type S3Store = AsyncToSyncStorageAdapter<S3AsyncStore, TokioBlockOn>;
 
 /// Opened array without loaded data (for lazy chunk loading)
 pub enum OpenArray {
@@ -42,14 +44,6 @@ impl OpenArray {
         match self {
             Self::Filesystem(arr) => arr.shape().to_vec(),
             Self::S3(arr) => arr.shape().to_vec(),
-        }
-    }
-
-    /// Get chunk grid shape (number of chunks per dimension)
-    pub fn chunk_grid_shape(&self) -> Vec<u64> {
-        match self {
-            Self::Filesystem(arr) => arr.chunk_grid_shape().to_vec(),
-            Self::S3(arr) => arr.chunk_grid_shape().to_vec(),
         }
     }
 
@@ -158,28 +152,21 @@ impl UnifiedStore {
             .ok_or_else(|| anyhow::anyhow!("Missing bucket in S3 URL"))?;
         let prefix = url.path().trim_start_matches('/').to_string();
 
-        // check if credentials are available via environment
-        let has_credentials = std::env::var("AWS_ACCESS_KEY_ID").is_ok()
-            && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok();
-
         let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
 
         // get region from env or default to us-east-1
         let region = std::env::var("AWS_REGION")
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-            .unwrap_or_else(|_| "us-east-1".to_string());
+            .unwrap_or_else(|_| AWS_DEFAULT_REGION.to_string());
         builder = builder.with_region(&region);
 
+        let has_credentials = std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+            && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok();
+
         if has_credentials {
-            // use explicit credentials from environment
             builder = builder
                 .with_access_key_id(std::env::var("AWS_ACCESS_KEY_ID").unwrap())
                 .with_secret_access_key(std::env::var("AWS_SECRET_ACCESS_KEY").unwrap());
-
-            // optional session token for temporary credentials
-            if let Ok(token) = std::env::var("AWS_SESSION_TOKEN") {
-                builder = builder.with_token(token);
-            }
         } else {
             // try anonymous access for public buckets
             builder = builder.with_skip_signature(true);
@@ -220,30 +207,6 @@ impl UnifiedStore {
         match self {
             Self::Filesystem(store, _) => load_coord_array_impl(store.clone(), array_path),
             Self::S3 { store, .. } => load_coord_array_impl(store.clone(), array_path),
-        }
-    }
-
-    /// Load a variable array as f32
-    pub fn load_variable_array(&self, array_path: &str) -> Result<ArrayD<f32>> {
-        match self {
-            Self::Filesystem(store, _) => load_variable_array_impl(store.clone(), array_path),
-            Self::S3 { store, .. } => load_variable_array_impl(store.clone(), array_path),
-        }
-    }
-
-    /// Open an array and extract metadata
-    pub fn open_array_meta(&self, array_path: &str) -> Result<ArrayMeta> {
-        match self {
-            Self::Filesystem(store, _) => {
-                let array = Array::open(store.clone(), array_path)?;
-                ArrayMeta::from_array(&array)
-                    .ok_or_else(|| anyhow::anyhow!("Missing dimension names in {}", array_path))
-            }
-            Self::S3 { store, .. } => {
-                let array = Array::open(store.clone(), array_path)?;
-                ArrayMeta::from_array(&array)
-                    .ok_or_else(|| anyhow::anyhow!("Missing dimension names in {}", array_path))
-            }
         }
     }
 
@@ -366,10 +329,11 @@ async fn discover_arrays_s3(
             };
 
             // get the first path component (array name)
-            if let Some(array_name) = rel_path.split('/').next() {
-                if !array_name.is_empty() && !array_name.starts_with('.') {
-                    array_dirs.insert(format!("/{}", array_name));
-                }
+            if let Some(array_name) = rel_path.split('/').next()
+                && !array_name.is_empty()
+                && !array_name.starts_with('.')
+            {
+                array_dirs.insert(format!("/{}", array_name));
             }
         }
     }
@@ -405,42 +369,6 @@ fn load_coord_array_impl<S: ReadableStorageTraits + ?Sized + 'static>(
             arr.iter().map(|&v| v as f32).collect()
         }
         dt => anyhow::bail!("Unsupported coordinate data type: {:?}", dt),
-    };
-
-    Ok(data)
-}
-
-fn load_variable_array_impl<S: ReadableStorageTraits + ?Sized + 'static>(
-    store: Arc<S>,
-    path: &str,
-) -> Result<ArrayD<f32>> {
-    let array = Array::open(store, path)?;
-    let shape = array.shape().to_vec();
-    let subset = ArraySubset::new_with_shape(shape);
-
-    let data: ArrayD<f32> = match array.data_type() {
-        DataType::Float32 => array.retrieve_array_subset_ndarray(&subset)?,
-        DataType::Float64 => {
-            let arr: ArrayD<f64> = array.retrieve_array_subset_ndarray(&subset)?;
-            arr.mapv(|v| v as f32)
-        }
-        DataType::Int32 => {
-            let arr: ArrayD<i32> = array.retrieve_array_subset_ndarray(&subset)?;
-            arr.mapv(|v| v as f32)
-        }
-        DataType::Int64 => {
-            let arr: ArrayD<i64> = array.retrieve_array_subset_ndarray(&subset)?;
-            arr.mapv(|v| v as f32)
-        }
-        DataType::UInt8 => {
-            let arr: ArrayD<u8> = array.retrieve_array_subset_ndarray(&subset)?;
-            arr.mapv(|v| v as f32)
-        }
-        DataType::UInt16 => {
-            let arr: ArrayD<u16> = array.retrieve_array_subset_ndarray(&subset)?;
-            arr.mapv(|v| v as f32)
-        }
-        dt => anyhow::bail!("Unsupported variable data type: {:?}", dt),
     };
 
     Ok(data)
