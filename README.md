@@ -11,7 +11,7 @@ A terminal-based interactive viewer for [Zarr](https://zarr.dev/) geospatial dat
 - **Multi-variable support** — switch between data variables on the fly
 - **Automatic coordinate detection** — discovers latitude/longitude dimensions from common naming conventions
 - **Block averaging** — downsampling when zoomed out for efficient rendering
-- **Colorbar legend** — always-visible gradient bar with labelled value range
+- **Colourbar legend** — always-visible gradient bar with labelled value range
 - **Status bar** — real-time cursor position, data value, zoom level, and chunk loading statistics
 
 ## Installation
