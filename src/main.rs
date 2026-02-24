@@ -22,6 +22,7 @@ use zarr::storage::{OpenArray, UnifiedStore};
 
 const DEFAULT_CHUNK_SIZE: usize = 256;
 const CACHE_CAPACITY: usize = 512;
+const MAX_CHUNKS_PER_FRAME: usize = 4;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -152,7 +153,7 @@ async fn main() -> Result<()> {
         visible_chunk_count = chunks.len();
 
         if let Some(array) = zarr_data.open_arrays.get(current_var_path) {
-            zarr_data.chunk_manager.load_visible_chunks(
+            zarr_data.chunk_manager.load_visible_chunks_limited(
                 current_var_path,
                 0,
                 &chunks,
@@ -160,6 +161,7 @@ async fn main() -> Result<()> {
                 current_meta.lat_axis,
                 current_meta.lon_axis,
                 current_ndim,
+                MAX_CHUNKS_PER_FRAME,
             );
         }
 

@@ -186,27 +186,27 @@ impl ChunkManager {
     }
 
     /// Load visible chunks that are not yet cached (loads all at once)
-    pub fn load_visible_chunks(
-        &mut self,
-        variable_name: &str,
-        time_idx: usize,
-        chunks: &[(usize, usize)],
-        array: &OpenArray,
-        lat_axis: usize,
-        lon_axis: usize,
-        ndim: usize,
-    ) {
-        self.load_visible_chunks_limited(
-            variable_name,
-            time_idx,
-            chunks,
-            array,
-            lat_axis,
-            lon_axis,
-            ndim,
-            usize::MAX,
-        );
-    }
+    // pub fn load_visible_chunks(
+    //     &mut self,
+    //     variable_name: &str,
+    //     time_idx: usize,
+    //     chunks: &[(usize, usize)],
+    //     array: &OpenArray,
+    //     lat_axis: usize,
+    //     lon_axis: usize,
+    //     ndim: usize,
+    // ) {
+    //     self.load_visible_chunks_limited(
+    //         variable_name,
+    //         time_idx,
+    //         chunks,
+    //         array,
+    //         lat_axis,
+    //         lon_axis,
+    //         ndim,
+    //         usize::MAX,
+    //     );
+    // }
 
     /// Load visible chunks with a per-call limit for responsive UI
     pub fn load_visible_chunks_limited(
