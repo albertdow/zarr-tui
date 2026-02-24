@@ -298,14 +298,6 @@ pub struct ChunkRange {
 }
 
 impl ChunkRange {
-    /// Check if array indices fall within this chunk
-    pub fn contains(&self, lat_idx: usize, lon_idx: usize) -> bool {
-        lat_idx >= self.lat_start
-            && lat_idx < self.lat_end
-            && lon_idx >= self.lon_start
-            && lon_idx < self.lon_end
-    }
-
     /// Convert global indices to local chunk indices
     pub fn to_local(&self, lat_idx: usize, lon_idx: usize) -> (usize, usize) {
         (lat_idx - self.lat_start, lon_idx - self.lon_start)
