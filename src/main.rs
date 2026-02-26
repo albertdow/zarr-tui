@@ -24,6 +24,21 @@ const DEFAULT_CHUNK_SIZE: usize = 256;
 const CACHE_CAPACITY: usize = 512;
 const MAX_CHUNKS_PER_FRAME: usize = 4;
 
+#[derive(Debug, Clone, Copy)]
+enum InputMode {
+    Vmin,
+    Vmax,
+}
+
+impl std::fmt::Display for InputMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InputMode::Vmin => write!(f, "vmin"),
+            InputMode::Vmax => write!(f, "vmax"),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let zarr_path = std::env::args()
@@ -116,6 +131,10 @@ async fn main() -> Result<()> {
     let mut show_help = false;
     let mut visible_chunk_count: usize;
     let mut current_colormap = ColormapType::Viridis;
+    let mut vmin: f32 = 0.005;
+    let mut vmax: f32 = 0.3;
+    let mut input_mode: Option<InputMode> = None; // "vmin" or "vmax"
+    let mut input_buffer = String::new();
 
     // hot loop
     while !should_quit {
@@ -184,8 +203,8 @@ async fn main() -> Result<()> {
             };
             let map_width = area.width.saturating_sub(colorbar_width);
 
-            let vmin = 0.005;
-            let vmax = 0.3;
+            let vmin = vmin;
+            let vmax = vmax;
 
             let points_per_pixel =
                 camera.data_points_per_pixel(&zarr_data.lat_data, &zarr_data.lon_data);
@@ -252,18 +271,29 @@ async fn main() -> Result<()> {
             // Render colorbar
             frame.render_widget(Colorbar::new(vmin, vmax, current_colormap), colorbar_area);
 
-            // render status bar
-            let status_data = StatusBarData {
-                cursor_lat: mouse_lat_lon.map(|(lat, _)| lat),
-                cursor_lon: mouse_lat_lon.map(|(_, lon)| lon),
-                cursor_value: clicked_value,
-                camera_zoom: camera.zoom,
-                variable_name: Some(current_var_name.clone()),
-                cached_chunks: Some(zarr_data.chunk_manager.cache_len()),
-                visible_chunks: Some(visible_chunk_count),
-                pending_chunks: Some(zarr_data.chunk_manager.pending_chunks),
-            };
-            frame.render_widget(StatusBar::new(&status_data), status_area);
+            // render status bar or input prompt
+            if let Some(mode) = input_mode {
+                let prompt = format!(" Enter {}: {}|", mode, input_buffer);
+                let style = ratatui::style::Style::default()
+                    .fg(ratatui::style::Color::Black)
+                    .bg(ratatui::style::Color::Yellow);
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new(prompt).style(style),
+                    status_area,
+                );
+            } else {
+                let status_data = StatusBarData {
+                    cursor_lat: mouse_lat_lon.map(|(lat, _)| lat),
+                    cursor_lon: mouse_lat_lon.map(|(_, lon)| lon),
+                    cursor_value: clicked_value,
+                    camera_zoom: camera.zoom,
+                    variable_name: Some(current_var_name.clone()),
+                    cached_chunks: Some(zarr_data.chunk_manager.cache_len()),
+                    visible_chunks: Some(visible_chunk_count),
+                    pending_chunks: Some(zarr_data.chunk_manager.pending_chunks),
+                };
+                frame.render_widget(StatusBar::new(&status_data), status_area);
+            }
 
             if show_help {
                 frame.render_widget(HelpOverlay::default(), area);
@@ -273,6 +303,30 @@ async fn main() -> Result<()> {
         let poll_timeout = std::time::Duration::from_millis(100);
         while event::poll(poll_timeout)? {
             match event::read()? {
+                Event::Key(key) if input_mode.is_some() => match key.code {
+                    KeyCode::Enter => {
+                        if let Ok(val) = input_buffer.parse::<f32>() {
+                            match input_mode {
+                                Some(InputMode::Vmin) => vmin = val,
+                                Some(InputMode::Vmax) => vmax = val,
+                                _ => {}
+                            }
+                        }
+                        input_mode = None;
+                        input_buffer.clear();
+                    }
+                    KeyCode::Esc => {
+                        input_mode = None;
+                        input_buffer.clear();
+                    }
+                    KeyCode::Backspace => {
+                        input_buffer.pop();
+                    }
+                    KeyCode::Char(c) => {
+                        input_buffer.push(c);
+                    }
+                    _ => {}
+                },
                 Event::Key(key) => match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => should_quit = true,
                     KeyCode::Char('+') | KeyCode::Char('=') => camera.zoom_in(),
@@ -291,6 +345,15 @@ async fn main() -> Result<()> {
                     // colormaps - cycle with c/C
                     KeyCode::Char('c') => current_colormap = current_colormap.next(),
                     KeyCode::Char('C') => current_colormap = current_colormap.prev(),
+                    // vmin/vmax input
+                    KeyCode::Char('v') => {
+                        input_mode = Some(InputMode::Vmin);
+                        input_buffer.clear();
+                    }
+                    KeyCode::Char('V') => {
+                        input_mode = Some(InputMode::Vmax);
+                        input_buffer.clear();
+                    }
                     // variables - switch (chunks loaded on demand, cache keyed by var name)
                     KeyCode::Char('[') => {
                         if !zarr_data.variables.is_empty() {

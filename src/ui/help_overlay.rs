@@ -26,6 +26,8 @@ impl HelpOverlay {
             ("Data", ""),
             ("  [  /  ]", "Previous / next variable"),
             ("  c  /  C", "Next / previous colormap"),
+            ("  v", "Set vmin (type value, Enter to confirm)"),
+            ("  V", "Set vmax (type value, Enter to confirm)"),
             ("", ""),
             ("Display", ""),
             ("  ?", "Toggle this help"),
