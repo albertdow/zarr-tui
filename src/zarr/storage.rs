@@ -18,6 +18,37 @@ use zarrs_storage::storage_adapter::async_to_sync::{
 
 const AWS_DEFAULT_REGION: &str = "eu-west-2";
 
+/// Read AWS credentials from `~/.aws/credentials` for the default or active profile
+fn read_aws_credentials() -> Option<(String, String)> {
+    let home = std::env::var("HOME").ok()?;
+    let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string());
+    let contents = std::fs::read_to_string(format!("{}/.aws/credentials", home)).ok()?;
+
+    let mut in_profile = false;
+    let mut key_id = None;
+    let mut secret = None;
+    let header = format!("[{}]", profile);
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed == header {
+            in_profile = true;
+        } else if trimmed.starts_with('[') {
+            if in_profile {
+                break;
+            }
+        } else if in_profile && let Some((k, v)) = trimmed.split_once('=') {
+            match k.trim() {
+                "aws_access_key_id" => key_id = Some(v.trim().to_string()),
+                "aws_secret_access_key" => secret = Some(v.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    key_id.zip(secret)
+}
+
 /// Tokio runtime blocker for async-to-sync conversion
 pub struct TokioBlockOn(tokio::runtime::Handle);
 
@@ -152,23 +183,44 @@ impl UnifiedStore {
             .ok_or_else(|| anyhow::anyhow!("Missing bucket in S3 URL"))?;
         let prefix = url.path().trim_start_matches('/').to_string();
 
-        let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
+        let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
 
-        // get region from env or default to us-east-1
+        // get region from env or default
         let region = std::env::var("AWS_REGION")
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|_| AWS_DEFAULT_REGION.to_string());
         builder = builder.with_region(&region);
 
-        let has_credentials = std::env::var("AWS_ACCESS_KEY_ID").is_ok()
-            && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok();
+        eprintln!("  S3 bucket: {}, region: {}", bucket, region);
+        eprintln!(
+            "  AWS_ACCESS_KEY_ID (env): {:?}",
+            std::env::var("AWS_ACCESS_KEY_ID").ok()
+        );
+        eprintln!(
+            "  AWS_SECRET_ACCESS_KEY (env): {}",
+            if std::env::var("AWS_SECRET_ACCESS_KEY").is_ok() {
+                "set"
+            } else {
+                "not set"
+            }
+        );
+        eprintln!(
+            "  AWS_PROFILE (env): {:?}",
+            std::env::var("AWS_PROFILE").ok()
+        );
 
-        if has_credentials {
+        // try env vars first, then ~/.aws/credentials, then anonymous
+        if std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+            && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok()
+        {
+            eprintln!("  Using credentials from environment variables");
+        } else if let Some((key_id, secret)) = read_aws_credentials() {
+            eprintln!("  Using credentials from ~/.aws/credentials");
             builder = builder
-                .with_access_key_id(std::env::var("AWS_ACCESS_KEY_ID").unwrap())
-                .with_secret_access_key(std::env::var("AWS_SECRET_ACCESS_KEY").unwrap());
+                .with_access_key_id(key_id)
+                .with_secret_access_key(secret);
         } else {
-            // try anonymous access for public buckets
+            eprintln!("  No credentials found, trying anonymous access");
             builder = builder.with_skip_signature(true);
         }
 
