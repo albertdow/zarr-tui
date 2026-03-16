@@ -17,12 +17,13 @@ use ratatui::{Terminal, layout::Rect, prelude::CrosstermBackend};
 
 use camera::Camera;
 use colormap::{ColorMap, ColormapType};
+use zarr::chunk_loader::ChunkLoader;
 use zarr::chunk_manager::{ChunkManager, visible_chunks};
 use zarr::storage::{OpenArray, UnifiedStore};
 
 const DEFAULT_CHUNK_SIZE: usize = 256;
-const CACHE_CAPACITY: usize = 512;
-const MAX_CHUNKS_PER_FRAME: usize = 4;
+const CACHE_CAPACITY: usize = 2048;
+const MAX_CONCURRENT_CHUNKS: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
 enum InputMode {
@@ -95,6 +96,9 @@ async fn main() -> Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+
+    // background chunk loader
+    let mut chunk_loader = ChunkLoader::new(MAX_CONCURRENT_CHUNKS);
 
     // app state
     let mut should_quit = false;
@@ -171,8 +175,12 @@ async fn main() -> Result<()> {
         );
         visible_chunk_count = chunks.len();
 
+        // drain completed chunks from background loader
+        zarr_data.chunk_manager.receive_chunks(&mut chunk_loader);
+
+        // send new requests for uncached visible chunks
         if let Some(array) = zarr_data.open_arrays.get(current_var_path) {
-            zarr_data.chunk_manager.load_visible_chunks_limited(
+            zarr_data.chunk_manager.request_visible_chunks(
                 current_var_path,
                 0,
                 &chunks,
@@ -180,7 +188,7 @@ async fn main() -> Result<()> {
                 current_meta.lat_axis,
                 current_meta.lon_axis,
                 current_ndim,
-                MAX_CHUNKS_PER_FRAME,
+                &chunk_loader,
             );
         }
 
@@ -259,11 +267,18 @@ async fn main() -> Result<()> {
                         }
                     };
 
-                    if let Some(v) = value {
-                        let color = ColorMap::map_value(v, vmin, vmax, current_colormap);
-                        let cell = &mut frame.buffer_mut()[(x, y)];
-                        cell.set_char(' ');
-                        cell.set_bg(color);
+                    match value {
+                        Some(v) => {
+                            let color = ColorMap::map_value(v, vmin, vmax, current_colormap);
+                            let cell = &mut frame.buffer_mut()[(x, y)];
+                            cell.set_char(' ');
+                            cell.set_bg(color);
+                        }
+                        None => {
+                            let cell = &mut frame.buffer_mut()[(x, y)];
+                            cell.set_char('░');
+                            cell.set_fg(ratatui::style::Color::DarkGray);
+                        }
                     }
                 }
             }
@@ -300,7 +315,7 @@ async fn main() -> Result<()> {
             }
         })?;
 
-        let poll_timeout = std::time::Duration::from_millis(100);
+        let poll_timeout = std::time::Duration::from_millis(16);
         while event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key) if input_mode.is_some() => match key.code {
