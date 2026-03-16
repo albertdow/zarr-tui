@@ -4,6 +4,7 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 
 use super::storage::OpenArray;
+use crate::zarr::chunk_loader::{ChunkLoader, ChunkRequest};
 
 /// Key for cached chunks
 #[derive(Hash, PartialEq, Eq, Clone)]
@@ -38,8 +39,6 @@ pub struct ChunkManager {
     pub chunk_size_lon: usize,
     pub total_lat: usize,
     pub total_lon: usize,
-    /// Number of chunks loaded in the last load call
-    pub last_loaded_count: usize,
     /// Number of chunks that were needed but not cached
     pub pending_chunks: usize,
 }
@@ -58,7 +57,6 @@ impl ChunkManager {
             chunk_size_lon,
             total_lat,
             total_lon,
-            last_loaded_count: 0,
             pending_chunks: 0,
         }
     }
@@ -185,31 +183,13 @@ impl ChunkManager {
         }
     }
 
-    /// Load visible chunks that are not yet cached (loads all at once)
-    // pub fn load_visible_chunks(
-    //     &mut self,
-    //     variable_name: &str,
-    //     time_idx: usize,
-    //     chunks: &[(usize, usize)],
-    //     array: &OpenArray,
-    //     lat_axis: usize,
-    //     lon_axis: usize,
-    //     ndim: usize,
-    // ) {
-    //     self.load_visible_chunks_limited(
-    //         variable_name,
-    //         time_idx,
-    //         chunks,
-    //         array,
-    //         lat_axis,
-    //         lon_axis,
-    //         ndim,
-    //         usize::MAX,
-    //     );
-    // }
+    /// Current cache size
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
 
-    /// Load visible chunks with a per-call limit for responsive UI
-    pub fn load_visible_chunks_limited(
+    /// Send requests for uncached visible chunks (non-blocking)
+    pub fn request_visible_chunks(
         &mut self,
         variable_name: &str,
         time_idx: usize,
@@ -218,73 +198,48 @@ impl ChunkManager {
         lat_axis: usize,
         lon_axis: usize,
         ndim: usize,
-        max_chunks: usize,
+        loader: &ChunkLoader,
     ) {
         let shape = array.shape();
-        let mut loaded = 0;
         let mut pending = 0;
-
+        let capacity = self.cache.cap().get();
         for &(chunk_lat, chunk_lon) in chunks {
+            // stop requesting if cache is full to avoid evicting loaded tiles
+            if self.cache.len() + pending >= capacity {
+                break;
+            }
             let key = ChunkKey::new(variable_name, time_idx, chunk_lat, chunk_lon);
             if self.cache.contains(&key) {
                 continue;
             }
-
-            // Count as pending
-            pending += 1;
-
-            if loaded >= max_chunks {
-                continue; // Still count pending but don't load
-            }
-
             let range = self.chunk_to_range(chunk_lat, chunk_lon);
-
-            // Clamp ranges to actual array shape to prevent out-of-bounds
-            let lat_end = (range.lat_end as u64).min(shape[lat_axis]);
-            let lon_end = (range.lon_end as u64).min(shape[lon_axis]);
-
-            // Skip if range is invalid (start >= end after clamping)
-            if range.lat_start as u64 >= lat_end || range.lon_start as u64 >= lon_end {
-                pending -= 1; // Not actually pending, just invalid
-                continue;
-            }
-
-            // build ranges for all dimensions
-            let ranges: Vec<Range<u64>> = (0..ndim)
-                .map(|dim| {
-                    if dim == lat_axis {
-                        range.lat_start as u64..lat_end
-                    } else if dim == lon_axis {
-                        range.lon_start as u64..lon_end
-                    } else {
-                        // for non-spatial dims like time, load single slice
-                        let idx = if dim == 0 { time_idx } else { 0 };
-                        let idx = (idx as u64).min(shape[dim].saturating_sub(1));
-                        idx..idx + 1
-                    }
-                })
-                .collect();
-
-            match array.retrieve_subset(&ranges) {
-                Ok(data) => {
-                    self.cache.put(key, CachedChunk { data, range });
-                    loaded += 1;
-                    pending -= 1; // No longer pending
-                }
-                Err(e) => {
-                    eprintln!("Chunk load error at ({},{}): {}", chunk_lat, chunk_lon, e);
-                    pending -= 1; // Failed, not pending
-                }
+            if let Some(ranges) =
+                build_chunk_ranges(&range, lat_axis, lon_axis, ndim, time_idx, &shape)
+            {
+                loader.request(ChunkRequest {
+                    key,
+                    ranges,
+                    range,
+                    array: array.clone(),
+                });
+                pending += 1;
             }
         }
-
-        self.last_loaded_count = loaded;
         self.pending_chunks = pending;
     }
 
-    /// Current cache size
-    pub fn cache_len(&self) -> usize {
-        self.cache.len()
+    /// Drain completed chunks into LRU cache
+    pub fn receive_chunks(&mut self, loader: &mut ChunkLoader) {
+        for result in loader.drain_results() {
+            match result.data {
+                Ok(cached) => {
+                    self.cache.put(result.key, cached);
+                }
+                Err(e) => {
+                    eprintln!("Chunk load error: {}", e);
+                }
+            }
+        }
     }
 }
 
@@ -371,4 +326,35 @@ fn find_nearest_index(data: &[f32], value: f32) -> Option<usize> {
     } else {
         Some(idx)
     }
+}
+
+/// Build dimension ranges for a chunk subset request.
+pub fn build_chunk_ranges(
+    range: &ChunkRange,
+    lat_axis: usize,
+    lon_axis: usize,
+    ndim: usize,
+    time_idx: usize,
+    shape: &[u64],
+) -> Option<Vec<Range<u64>>> {
+    let lat_end = (range.lat_end as u64).min(shape[lat_axis]);
+    let lon_end = (range.lon_end as u64).min(shape[lon_axis]);
+
+    if range.lat_start as u64 >= lat_end || range.lon_start as u64 >= lon_end {
+        return None;
+    }
+    let ranges: Vec<Range<u64>> = (0..ndim)
+        .map(|dim| {
+            if dim == lat_axis {
+                range.lat_start as u64..lat_end
+            } else if dim == lon_axis {
+                range.lon_start as u64..lon_end
+            } else {
+                let idx = if dim == 0 { time_idx } else { 0 };
+                let idx = (idx as u64).min(shape[dim].saturating_sub(1));
+                idx..idx + 1
+            }
+        })
+        .collect();
+    Some(ranges)
 }

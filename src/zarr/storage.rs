@@ -64,6 +64,7 @@ pub type S3AsyncStore = AsyncObjectStore<S3ObjectStore>;
 pub type S3Store = AsyncToSyncStorageAdapter<S3AsyncStore, TokioBlockOn>;
 
 /// Opened array without loaded data (for lazy chunk loading)
+#[derive(Clone)]
 pub enum OpenArray {
     Filesystem(Arc<Array<FilesystemStore>>),
     S3(Arc<Array<S3Store>>),
